@@ -1,112 +1,73 @@
-from fastapi import FastAPI, Form, File, UploadFile, HTTPException, status
-from db import events_collection
+from fastapi import FastAPI
 from pydantic import BaseModel
-from bson.objectid import ObjectId
-from utils import replace_mongo_id
-from typing import Annotated 
-import cloudinary
-import cloudinary.uploader
-#import cloudinary.api
+import requests
+from bson import ObjectId
+from db import pets_collection
+# import os
 
-# Configure cloudinary
-cloudinary.config(
-    cloud_name = "dvgok8uab",
-    api_key = "218273314893292",
-    api_secret = "BgQmV1LfDFqMOrx-3tua9epnftE"
-)
+# --- FastAPI App ---
+app = FastAPI(title="😸🐶 RHIUNNE'S Pet Gallery API")
 
-class EventModel(BaseModel):
-    title: str
-    description: str
+# --- Models ---
+class FavouritePets(BaseModel):
+    image_url: str
+    animal_type: str
+    user_comment: str
 
-app = FastAPI()
+class VotePet(BaseModel):
+    vote: str
 
-@app.get("/")
-def get_home():
-    return {"message": "You are on the home page"}
+# --- Utility Function ---
+def serialize_pet(pet):
+    return {
+        "id": str(pet["_id"]),
+        "image_url": pet["image_url"],
+        "animal_type": pet["animal_type"],
+        "user_comment": pet["user_comment"],
+        "votes": pet["votes"]
+    }
 
-# Events endpoints
-@app.get("/events")
-def get_events(title="", description="", limit=10, skip=0):
-    # Get all events from database
-    events = events_collection.find(
-        filter={
-            "$or":[
-                {"title":{"$regex":title,"$options":"i"}},
-                {"description":{"$regex":description,"$options":"i"}}
-            ]
-        },
-        limit=int(limit),
-        skip=int(skip)
-    ).to_list()
-    # Return response
-    return {"data": list(map(replace_mongo_id, events))}
+# --- Endpoints ---
 
+@app.get("/pets/random")
+def get_random_pet(animal_type: str = "dog"):
+    if animal_type == "dog":
+        res = requests.get("https://dog.ceo/api/breeds/image/random")
+        image_url = res.json()["message"]
+    else:
+        res = requests.get("https://api.thecatapi.com/v1/images/search")
+        image_url = res.json()[0]["url"]
 
-@app.post("/events")
-def post_event(
-    title: Annotated[str, Form()],
-    description: Annotated[str, Form()],
-    flyer: Annotated[UploadFile, File()]):
-    # Upload flyer to cloudinary to get url
-    upload_result = cloudinary.uploader.upload(flyer.file)
-    print(upload_result)
-    # Insert event into database
-    events_collection.insert_one({
-        "title": title,
-        "description": description,
-        "flyer": upload_result["secure_url"]
-    })
-    # Return response
-    return {"message": "Event added successfully"}
+    return {"animal_type": animal_type, "image_url": image_url}
 
-@app.get("/events/{event_id}")
-def get_event_by_id(event_id):
-    # Check if event id is valid
-    if not ObjectId.is_valid(event_id):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
-        "Invalid mongo id received!")
-    # Get event from database by id
-    event = events_collection.find_one({"_id": ObjectId(event_id)})
-    # Return response
-    return {"data": replace_mongo_id(event)}
+@app.post("/pets/favorites")
+def add_favorite(pet: FavouritePets):
+    pet_data = pet.dict()
+    pet_data["votes"] = {"up": 0, "down": 0}
+    result = pets_collection.insert_one(pet_data)
+    return {"id": str(result.inserted_id), **pet_data}
 
+@app.get("/pets/favorites")
+def list_favorites():
+    pets = list(pets_collection.find())
+    return {"favorites": [serialize_pet(p) for p in pets]}
 
-@app.put("/events/{event_id}")
-def replace_event(
-    event_id, 
-    title: Annotated[str, Form()],
-    description: Annotated[str, Form()],
-    flyer: Annotated[UploadFile, File()]):
+@app.post("/pets/favorites/{pet_id}/vote")
+def vote_pet(pet_id: str, vote: VotePet):
+    if vote.vote not in ["up", "down"]:
+        return {"error": "vote must be 'up' or 'down'"}
 
-    # Check if event id is valid mongo id
-    if not ObjectId.is_valid(event_id):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid mongo id received!")
-    
-    # Upload flyer to cloudinary to get url
-    upload_result = cloudinary.uploader.upload(flyer.file)
-
-    # Replace event in database
-    events_collection.replace_one(
-        filter={"_id": ObjectId(event_id)},
-        replacement={
-            "title": title,
-            "description": description,
-            "flyer": upload_result["secure_url"]
-        }
-    )
-    # Return response 
-    return {"message": "Event replaced successfully"}
-
-@app.delete("/events/{event_id}")
-def delete_event(event_id):
-    # Check if event id is valid mongo id
-    if not ObjectId.is_valid(event_id):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid mongo id received!"
+    try:
+        result = pets_collection.update_one(
+            {"_id": ObjectId(pet_id)},
+            {"$inc": {f"votes.{vote.vote}": 1}}
         )
-    # Delete event from database
-    delete_result = events_collection.delete_one(filter={"_id": ObjectId(event_id)})
-    if not delete_result.deleted_count:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Sorry, no event found to delte!")
-    # Return response
-    return{"message": "Event deleted succesfully."}
+
+        if result.matched_count == 0:
+            return {"error": "Pet not found"}
+
+        pet = pets_collection.find_one({"_id": ObjectId(pet_id)})
+        return serialize_pet(pet)
+
+    except Exception as e:
+        return {"error": str(e)}
